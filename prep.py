@@ -128,6 +128,19 @@ def mcp_discover() -> tuple[str, str, str]:
     return slack_url, drive_url, token
 
 
+def mcp_list_tools(url: str, token: str, timeout: int = 30) -> list[str]:
+    """Return the tool names exposed by an MCP server at URL."""
+    body = json.dumps({"jsonrpc": "2.0", "method": "tools/list", "id": 1}).encode()
+    req = urllib.request.Request(url, data=body, headers={
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        resp = json.loads(r.read())
+    tools = (resp.get("result") or {}).get("tools", []) or []
+    return [t.get("name") for t in tools if t.get("name")]
+
+
 def mcp_call(url: str, token: str, tool_name: str, args: dict, timeout: int = 60) -> dict:
     body = json.dumps({
         "jsonrpc": "2.0", "method": "tools/call", "id": 1,
@@ -577,8 +590,58 @@ def build_csv(util: dict, info: dict, today: date) -> str:
     return buf.getvalue()
 
 
-def upload_sheet(csv_content: str, drive_url: str, token: str, today: date) -> str | None:
-    """Upload CSV to Drive as a Google Sheet; return viewUrl or None on failure."""
+# Candidate tool names to try when creating a file on the Drive MCP.
+# claude.ai's Drive connector uses `create_file`; Google's drivemcp.googleapis.com
+# may use different naming. We try each in order and use the first that works.
+DRIVE_CREATE_CANDIDATES = [
+    "create_file",
+    "createFile",
+    "drive_create_file",
+    "files_create",
+    "upload_file",
+    "uploadFile",
+]
+
+
+def _extract_file_url(resp: dict) -> str | None:
+    """Try multiple response shapes to extract a Drive file URL or ID."""
+    try:
+        result = resp.get("result") or {}
+        # Shape 1: {result: {content: [{text: "<json str>"}]}}
+        for c in (result.get("content") or []):
+            text = c.get("text")
+            if not text:
+                continue
+            try:
+                meta = json.loads(text)
+            except Exception:
+                continue
+            url = meta.get("viewUrl") or meta.get("webViewLink") or meta.get("url")
+            if url:
+                return url
+            if meta.get("id"):
+                return f"https://docs.google.com/spreadsheets/d/{meta['id']}"
+        # Shape 2: direct metadata in result
+        for key in ("viewUrl", "webViewLink", "url"):
+            if key in result:
+                return result[key]
+        if "id" in result:
+            return f"https://docs.google.com/spreadsheets/d/{result['id']}"
+    except Exception:
+        pass
+    return None
+
+
+def upload_sheet(
+    csv_content: str,
+    drive_url: str,
+    token: str,
+    today: date,
+    errors: list[str],
+    drive_tools: list[str] | None = None,
+) -> str | None:
+    """Upload CSV to Drive as a Google Sheet; return viewUrl or None on failure.
+    Appends detailed diagnostics to `errors` so they show up in briefing_status.json."""
     b64 = base64.b64encode(csv_content.encode("utf-8")).decode("ascii")
     args = {
         "title": f"Fairgrounds Utilization {today.isoformat()}",
@@ -586,28 +649,46 @@ def upload_sheet(csv_content: str, drive_url: str, token: str, today: date) -> s
         "parentId": HEATMAP_FOLDER_ID,
         "content": b64,
     }
-    try:
-        resp = mcp_call(drive_url, token, "create_file", args)
-    except Exception as e:
-        print(f"[upload_sheet] MCP call failed: {e}", file=sys.stderr)
-        return None
 
-    # MCP response shape: {result: {content: [{text: "<json str>"}]}}
-    try:
-        result = resp.get("result", {})
-        content_list = result.get("content", [])
-        if content_list:
-            text_payload = content_list[0].get("text", "")
-            if text_payload:
-                meta = json.loads(text_payload)
-                return meta.get("viewUrl") or f"https://docs.google.com/spreadsheets/d/{meta.get('id')}"
-        # Some variants may return file metadata directly
-        if "viewUrl" in result:
-            return result["viewUrl"]
-        if "id" in result:
-            return f"https://docs.google.com/spreadsheets/d/{result['id']}"
-    except Exception as e:
-        print(f"[upload_sheet] Parse response failed: {e} — resp={resp}", file=sys.stderr)
+    # Prefer tools we know exist on this MCP; fall back to the full candidate list.
+    if drive_tools:
+        try_tools = [t for t in DRIVE_CREATE_CANDIDATES if t in drive_tools] or drive_tools
+    else:
+        try_tools = DRIVE_CREATE_CANDIDATES
+
+    for tool in try_tools:
+        try:
+            resp = mcp_call(drive_url, token, tool, args)
+        except urllib.error.HTTPError as he:
+            body = ""
+            try:
+                body = he.read().decode()[:500]
+            except Exception:
+                pass
+            errors.append(f"drive {tool}: HTTP {he.code} {body}")
+            print(f"[upload_sheet] {tool} HTTP {he.code}: {body}", file=sys.stderr)
+            continue
+        except Exception as e:
+            errors.append(f"drive {tool}: {type(e).__name__}: {e}")
+            print(f"[upload_sheet] {tool} raised: {e}", file=sys.stderr)
+            continue
+
+        # Check for MCP-level error in response
+        if isinstance(resp, dict) and "error" in resp:
+            errors.append(f"drive {tool}: MCP error {resp['error']}")
+            print(f"[upload_sheet] {tool} returned MCP error: {resp.get('error')}", file=sys.stderr)
+            continue
+
+        url = _extract_file_url(resp)
+        if url:
+            print(f"[upload_sheet] success via {tool}: {url}", file=sys.stderr)
+            return url
+
+        # Response looked ok but we couldn't extract a URL — log raw for debugging
+        snippet = json.dumps(resp)[:500]
+        errors.append(f"drive {tool}: could not parse response — {snippet}")
+        print(f"[upload_sheet] {tool} response had no URL: {snippet}", file=sys.stderr)
+
     return None
 
 
@@ -755,7 +836,17 @@ def main() -> int:
         heatmap_url = None
         if not dry_run:
             slack_url, drive_url, token = mcp_discover()
-            heatmap_url = upload_sheet(csv_content, drive_url, token, today)
+            # Probe the Drive MCP's actual tool surface — helps when the trigger's
+            # Drive MCP (e.g. drivemcp.googleapis.com) doesn't match claude.ai's schema.
+            drive_tools: list[str] = []
+            try:
+                drive_tools = mcp_list_tools(drive_url, token)
+                print(f"[prep] drive_tools={drive_tools}", file=sys.stderr)
+                status["drive_tools"] = drive_tools
+            except Exception as e:
+                errors.append(f"drive tools/list failed: {type(e).__name__}: {e}")
+                print(f"[prep] drive tools/list failed: {e}", file=sys.stderr)
+            heatmap_url = upload_sheet(csv_content, drive_url, token, today, errors, drive_tools)
             if not heatmap_url:
                 errors.append("Drive upload failed; using folder URL as fallback")
                 heatmap_url = HEATMAP_FOLDER_URL
