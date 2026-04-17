@@ -40,26 +40,6 @@ PODPLAY_BASE = "https://fairgrounds.podplay.app/apis/v2"
 HEATMAP_FOLDER_ID = "1S_Cn6mgoKnMh00lBc78YsX-9wDfxYmTP"
 HEATMAP_FOLDER_URL = f"https://drive.google.com/drive/folders/{HEATMAP_FOLDER_ID}"
 
-DEFAULT_OPERATING_HALFHOURS = 26  # fallback when a pod is missing openTime/closeTime (13 hours × 2)
-
-
-def operating_halfhours(pod: dict) -> int:
-    """Half-hours of operation per day based on pod's openTime/closeTime.
-    Falls back to DEFAULT_OPERATING_HALFHOURS if missing or malformed."""
-    op, cl = pod.get("openTime") or {}, pod.get("closeTime") or {}
-    try:
-        oh = int(op.get("hours", 0))
-        om = int(op.get("minutes", 0))
-        ch = int(cl.get("hours", 0))
-        cm = int(cl.get("minutes", 0))
-        start_minutes = oh * 60 + om
-        end_minutes = ch * 60 + cm
-        if end_minutes <= start_minutes:
-            return DEFAULT_OPERATING_HALFHOURS
-        hh = (end_minutes - start_minutes) // 30
-        return hh if hh > 0 else DEFAULT_OPERATING_HALFHOURS
-    except Exception:
-        return DEFAULT_OPERATING_HALFHOURS
 
 # Channel mappings (test vs prod). Match by substring (case-insensitive) against displayName.
 CHANNEL_MAP_TEST = {
@@ -171,7 +151,6 @@ def fetch_areas() -> dict:
     areas_out = []
     pod_to_area = {}
     pod_capacity = {}
-    pod_hours: dict[str, int] = {}  # pod_id -> operating halfhours/day
     pod_category = {}
     pod_timezone = {}
     area_timezone = {}
@@ -205,9 +184,6 @@ def fetch_areas() -> dict:
             pod_capacity[pod_id] = cap
             pod_timezone[pod_id] = pod.get("timezone") or "America/Toronto"
             tz_fallback = tz_fallback or pod_timezone[pod_id]
-
-            # Operating hours for denominator — pod-level openTime/closeTime, 2-decimal halfhours
-            pod_hours[pod_id] = operating_halfhours(pod)
 
             # Leaside pod categorization
             if "leaside" in dlo:
@@ -247,7 +223,6 @@ def fetch_areas() -> dict:
         "areas": areas_out,
         "pod_to_area": pod_to_area,
         "pod_capacity": pod_capacity,
-        "pod_hours": pod_hours,
         "pod_category": pod_category,
         "pod_timezone": pod_timezone,
         "area_timezone": area_timezone,
