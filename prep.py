@@ -394,20 +394,39 @@ def clamp01(v: float) -> float:
 
 # ----------------------------- Event categorization -----------------------------
 
+CATEGORIES_ORDER = ["Open Play", "Leagues", "Clinics & Lessons", "Private Events"]
+
+# PodPlay tags every event with a subtype. Map it directly — do not rely on
+# name keywords, which silently drop anything PodPlay introduces a new label
+# for (e.g. KIDS_CLASS, TOURNAMENT).
+SUBTYPE_TO_CATEGORY = {
+    "open_play":     "Open Play",
+    "league_night":  "Leagues",
+    "tournament":    "Leagues",
+    "adult_class":   "Clinics & Lessons",
+    "kids_class":    "Clinics & Lessons",
+    "coaching":      "Clinics & Lessons",
+    "private_event": "Private Events",
+    "party":         "Private Events",
+    "private":       "Private Court Bookings",
+    "operations":    "Operations",
+}
+
+# Name-keyword fallback for events with no subtype set (legacy safety net).
 CLINIC_KEYWORDS = ["clinic", "lesson", "class", "cardio", "coach", "foundations",
                    "101", "learn to play", "prep", "tactics", "positioning"]
 OPENPLAY_KEYWORDS = ["open play", "liveball", "live ball"]
 LEAGUE_KEYWORDS = ["league", "ladder", "dupr"]
 
-CATEGORIES_ORDER = ["Open Play", "Leagues", "Clinics & Lessons", "Private Events"]
-
 
 def categorize_event(event: dict) -> str:
+    subtype = (event.get("subtype") or "").lower()
+    if subtype in SUBTYPE_TO_CATEGORY:
+        return SUBTYPE_TO_CATEGORY[subtype]
+
     name = (event.get("name") or "").lower()
     custom = (event.get("customType") or "").lower()
-    subtype = (event.get("subtype") or "").lower()
-
-    if custom == "private event" or subtype == "private_event":
+    if custom == "private event":
         return "Private Events"
     if custom == "private":
         return "Private Court Bookings"
@@ -450,6 +469,8 @@ def categorize_events_by_area(events: list, info: dict) -> dict:
             continue
 
         cat = categorize_event(ev)
+        if cat == "Operations":
+            continue
         area_buckets.setdefault(area_id, {c: [] for c in CATEGORIES_ORDER + ["Other"]})
 
         if cat == "Private Court Bookings":
