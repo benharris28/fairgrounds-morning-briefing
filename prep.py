@@ -624,11 +624,29 @@ DRIVE_CREATE_CANDIDATES = [
 ]
 
 
+def _url_from_meta(meta: dict) -> str | None:
+    if not isinstance(meta, dict):
+        return None
+    url = meta.get("viewUrl") or meta.get("webViewLink") or meta.get("url")
+    if url:
+        return url
+    fid = meta.get("id")
+    if fid:
+        return f"https://docs.google.com/spreadsheets/d/{fid}"
+    return None
+
+
 def _extract_file_url(resp: dict) -> str | None:
     """Try multiple response shapes to extract a Drive file URL or ID."""
     try:
         result = resp.get("result") or {}
-        # Shape 1: {result: {content: [{text: "<json str>"}]}}
+        # Shape 1 (MCP 2025 spec): structuredContent holds the tool's return object
+        sc = result.get("structuredContent")
+        if isinstance(sc, dict):
+            url = _url_from_meta(sc)
+            if url:
+                return url
+        # Shape 2: result.content[].text contains JSON
         for c in (result.get("content") or []):
             text = c.get("text")
             if not text:
@@ -637,17 +655,13 @@ def _extract_file_url(resp: dict) -> str | None:
                 meta = json.loads(text)
             except Exception:
                 continue
-            url = meta.get("viewUrl") or meta.get("webViewLink") or meta.get("url")
+            url = _url_from_meta(meta)
             if url:
                 return url
-            if meta.get("id"):
-                return f"https://docs.google.com/spreadsheets/d/{meta['id']}"
-        # Shape 2: direct metadata in result
-        for key in ("viewUrl", "webViewLink", "url"):
-            if key in result:
-                return result[key]
-        if "id" in result:
-            return f"https://docs.google.com/spreadsheets/d/{result['id']}"
+        # Shape 3: direct metadata on result
+        url = _url_from_meta(result)
+        if url:
+            return url
     except Exception:
         pass
     return None
