@@ -28,6 +28,7 @@ import http.client
 import io
 import json
 import os
+import random
 import re
 import socket
 import sys
@@ -93,10 +94,11 @@ HANGUL_FILLER = "\u3164"  # invisible line for Slack vertical spacing
 USER_AGENT = "fairgrounds-morning-briefing/1.0 (+https://github.com/benharris28/fairgrounds-morning-briefing)"
 
 
-def podplay_get(path: str, timeout: int = 90, max_retries: int = 3) -> dict:
+def podplay_get(path: str, timeout: int = 90, max_retries: int = 5) -> dict:
     """GET with exponential backoff on transient failures (IncompleteRead,
-    connection resets, timeouts, 5xx). Large forward-session responses are the
-    most common victims of mid-stream drops."""
+    connection resets, timeouts, 5xx, 429). Schedule: ~5s, 15s, 45s, 90s, 90s
+    (with 0–30% jitter) — roughly a 4-minute budget, enough to ride out a
+    short PodPlay WAF/rate-limit blip or CDN edge wobble."""
     key = os.environ["API_KEY"]
     url = f"{PODPLAY_BASE}{path}"
     headers = {
@@ -120,9 +122,10 @@ def podplay_get(path: str, timeout: int = 90, max_retries: int = 3) -> dict:
             last_exc = e
         if attempt == max_retries:
             break
-        backoff = 2 ** (attempt + 1)  # 2s, 4s, 8s
+        base = min(90, 5 * (3 ** attempt))  # 5, 15, 45, 90, 90
+        backoff = base + random.uniform(0, base * 0.3)
         print(f"[podplay_get] {path} attempt {attempt + 1} failed "
-              f"({type(last_exc).__name__}: {last_exc}); retrying in {backoff}s",
+              f"({type(last_exc).__name__}: {last_exc}); retrying in {backoff:.1f}s",
               file=sys.stderr)
         time.sleep(backoff)
     assert last_exc is not None
