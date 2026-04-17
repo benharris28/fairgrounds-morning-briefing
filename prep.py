@@ -24,12 +24,16 @@ from __future__ import annotations
 import base64
 import csv
 import glob
+import http.client
 import io
 import json
 import os
 import re
+import socket
 import sys
+import time
 import traceback
+import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -89,18 +93,40 @@ HANGUL_FILLER = "\u3164"  # invisible line for Slack vertical spacing
 USER_AGENT = "fairgrounds-morning-briefing/1.0 (+https://github.com/benharris28/fairgrounds-morning-briefing)"
 
 
-def podplay_get(path: str, timeout: int = 90) -> dict:
+def podplay_get(path: str, timeout: int = 90, max_retries: int = 3) -> dict:
+    """GET with exponential backoff on transient failures (IncompleteRead,
+    connection resets, timeouts, 5xx). Large forward-session responses are the
+    most common victims of mid-stream drops."""
     key = os.environ["API_KEY"]
-    req = urllib.request.Request(
-        f"{PODPLAY_BASE}{path}",
-        headers={
-            "x-api-key": key,
-            "accept": "application/json",
-            "user-agent": USER_AGENT,
-        },
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())
+    url = f"{PODPLAY_BASE}{path}"
+    headers = {
+        "x-api-key": key,
+        "accept": "application/json",
+        "user-agent": USER_AGENT,
+    }
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            # Retry only 5xx + 429; re-raise 4xx immediately (auth/bad request)
+            if e.code < 500 and e.code != 429:
+                raise
+            last_exc = e
+        except (http.client.IncompleteRead, urllib.error.URLError,
+                socket.timeout, TimeoutError, ConnectionError) as e:
+            last_exc = e
+        if attempt == max_retries:
+            break
+        backoff = 2 ** (attempt + 1)  # 2s, 4s, 8s
+        print(f"[podplay_get] {path} attempt {attempt + 1} failed "
+              f"({type(last_exc).__name__}: {last_exc}); retrying in {backoff}s",
+              file=sys.stderr)
+        time.sleep(backoff)
+    assert last_exc is not None
+    raise last_exc
 
 
 def mcp_discover() -> tuple[str, str, str]:
