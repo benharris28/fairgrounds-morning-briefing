@@ -154,15 +154,39 @@ def mcp_discover() -> tuple[str, str, str]:
     return slack_url, drive_url, token
 
 
+MCP_HEADERS_BASE = {
+    "Content-Type": "application/json",
+    # Streamable HTTP transport requires both; server picks one in Content-Type.
+    "Accept": "application/json, text/event-stream",
+}
+
+
+def _mcp_parse_response(raw: bytes, content_type: str) -> dict:
+    """MCP Streamable HTTP can reply with application/json OR text/event-stream.
+    In SSE the body is a sequence of `data: <json>\\n\\n` frames; we want the
+    last `data:` line (the final JSON-RPC response)."""
+    ct = (content_type or "").lower()
+    text = raw.decode("utf-8", errors="replace")
+    if "text/event-stream" in ct or text.lstrip().startswith("event:") or text.lstrip().startswith("data:"):
+        last_data = None
+        for line in text.splitlines():
+            if line.startswith("data:"):
+                last_data = line[5:].strip()
+        if last_data is None:
+            raise ValueError(f"SSE response had no data frames: {text[:200]!r}")
+        return json.loads(last_data)
+    return json.loads(text)
+
+
 def mcp_list_tools(url: str, token: str, timeout: int = 30) -> list[str]:
     """Return the tool names exposed by an MCP server at URL."""
     body = json.dumps({"jsonrpc": "2.0", "method": "tools/list", "id": 1}).encode()
     req = urllib.request.Request(url, data=body, headers={
+        **MCP_HEADERS_BASE,
         "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
     })
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        resp = json.loads(r.read())
+        resp = _mcp_parse_response(r.read(), r.headers.get("Content-Type", ""))
     tools = (resp.get("result") or {}).get("tools", []) or []
     return [t.get("name") for t in tools if t.get("name")]
 
@@ -173,11 +197,11 @@ def mcp_call(url: str, token: str, tool_name: str, args: dict, timeout: int = 60
         "params": {"name": tool_name, "arguments": args},
     }).encode()
     req = urllib.request.Request(url, data=body, headers={
+        **MCP_HEADERS_BASE,
         "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
     })
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())
+        return _mcp_parse_response(r.read(), r.headers.get("Content-Type", ""))
 
 
 # ----------------------------- Areas + pods -----------------------------
