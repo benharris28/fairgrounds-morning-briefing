@@ -40,7 +40,26 @@ PODPLAY_BASE = "https://fairgrounds.podplay.app/apis/v2"
 HEATMAP_FOLDER_ID = "1S_Cn6mgoKnMh00lBc78YsX-9wDfxYmTP"
 HEATMAP_FOLDER_URL = f"https://drive.google.com/drive/folders/{HEATMAP_FOLDER_ID}"
 
-CAPACITY_HALFHOURS_PER_DAY = 26  # 13 operating hours × 2 half-hours
+DEFAULT_OPERATING_HALFHOURS = 26  # fallback when a pod is missing openTime/closeTime (13 hours × 2)
+
+
+def operating_halfhours(pod: dict) -> int:
+    """Half-hours of operation per day based on pod's openTime/closeTime.
+    Falls back to DEFAULT_OPERATING_HALFHOURS if missing or malformed."""
+    op, cl = pod.get("openTime") or {}, pod.get("closeTime") or {}
+    try:
+        oh = int(op.get("hours", 0))
+        om = int(op.get("minutes", 0))
+        ch = int(cl.get("hours", 0))
+        cm = int(cl.get("minutes", 0))
+        start_minutes = oh * 60 + om
+        end_minutes = ch * 60 + cm
+        if end_minutes <= start_minutes:
+            return DEFAULT_OPERATING_HALFHOURS
+        hh = (end_minutes - start_minutes) // 30
+        return hh if hh > 0 else DEFAULT_OPERATING_HALFHOURS
+    except Exception:
+        return DEFAULT_OPERATING_HALFHOURS
 
 # Channel mappings (test vs prod). Match by substring (case-insensitive) against displayName.
 CHANNEL_MAP_TEST = {
@@ -87,11 +106,18 @@ HANGUL_FILLER = "\u3164"  # invisible line for Slack vertical spacing
 
 # ----------------------------- HTTP helpers -----------------------------
 
+USER_AGENT = "fairgrounds-morning-briefing/1.0 (+https://github.com/benharris28/fairgrounds-morning-briefing)"
+
+
 def podplay_get(path: str, timeout: int = 90) -> dict:
     key = os.environ["API_KEY"]
     req = urllib.request.Request(
         f"{PODPLAY_BASE}{path}",
-        headers={"x-api-key": key, "accept": "application/json"},
+        headers={
+            "x-api-key": key,
+            "accept": "application/json",
+            "user-agent": USER_AGENT,
+        },
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
@@ -145,6 +171,7 @@ def fetch_areas() -> dict:
     areas_out = []
     pod_to_area = {}
     pod_capacity = {}
+    pod_hours: dict[str, int] = {}  # pod_id -> operating halfhours/day
     pod_category = {}
     pod_timezone = {}
     area_timezone = {}
@@ -168,7 +195,9 @@ def fetch_areas() -> dict:
             if "court" not in pd:
                 continue
             tables = (pod.get("tables") or {}).get("items", []) or []
-            cap = len(tables)
+            # Count only AVAILABLE tables — NOT_AVAILABLE tables still appear in the list
+            # but aren't bookable (e.g., Leaside Pickleball has 13 entries but only 11 are live).
+            cap = sum(1 for t in tables if t.get("status") == "AVAILABLE")
             if cap == 0:
                 continue
             pod_id = pod["id"]
@@ -176,6 +205,9 @@ def fetch_areas() -> dict:
             pod_capacity[pod_id] = cap
             pod_timezone[pod_id] = pod.get("timezone") or "America/Toronto"
             tz_fallback = tz_fallback or pod_timezone[pod_id]
+
+            # Operating hours for denominator — pod-level openTime/closeTime, 2-decimal halfhours
+            pod_hours[pod_id] = operating_halfhours(pod)
 
             # Leaside pod categorization
             if "leaside" in dlo:
@@ -215,6 +247,7 @@ def fetch_areas() -> dict:
         "areas": areas_out,
         "pod_to_area": pod_to_area,
         "pod_capacity": pod_capacity,
+        "pod_hours": pod_hours,
         "pod_category": pod_category,
         "pod_timezone": pod_timezone,
         "area_timezone": area_timezone,
@@ -224,10 +257,37 @@ def fetch_areas() -> dict:
 
 # ----------------------------- Sessions + events -----------------------------
 
+MAX_SESSION_WINDOW_DAYS = 7  # PodPlay returns 500/503 for wider ranges
+
+
 def fetch_sessions(start: date, end: date) -> list:
-    path = f"/sessions?startTime={start.isoformat()}T04:00:00Z&endTime={end.isoformat()}T07:00:00Z"
-    data = podplay_get(path)
-    return data.get("items", []) or []
+    """Fetch /sessions; auto-chunks windows larger than 7 days (PodPlay limit)."""
+    total_days = (end - start).days
+    if total_days <= MAX_SESSION_WINDOW_DAYS:
+        path = f"/sessions?startTime={start.isoformat()}T04:00:00Z&endTime={end.isoformat()}T07:00:00Z"
+        data = podplay_get(path)
+        return data.get("items", []) or []
+
+    # Chunk into overlapping half-open ranges
+    chunks: list[tuple[date, date]] = []
+    cursor = start
+    while cursor < end:
+        chunk_end = min(end, cursor + timedelta(days=MAX_SESSION_WINDOW_DAYS))
+        chunks.append((cursor, chunk_end))
+        cursor = chunk_end
+
+    items: list = []
+    seen_ids: set[str] = set()
+    with ThreadPoolExecutor(max_workers=min(4, len(chunks))) as ex:
+        futures = [ex.submit(fetch_sessions, s, e) for (s, e) in chunks]
+        for fut in futures:
+            for s in fut.result():
+                sid = s.get("id") or f"{(s.get('pod') or {}).get('id')}@{s.get('startTime')}"
+                if sid in seen_ids:
+                    continue
+                seen_ids.add(sid)
+                items.append(s)
+    return items
 
 
 def fetch_events(start: date, end: date) -> list:
@@ -254,8 +314,15 @@ def parse_iso(s: str | None) -> datetime | None:
 # ----------------------------- Utilization -----------------------------
 
 def compute_utilization(sessions: list, info: dict) -> dict:
-    """Returns {area_id: {date_str: util}} where util is a float OR
-    for Leaside, a dict {"total": f, "indoor_padel": f, "outdoor_padel": f, "pickle": f}."""
+    """Returns {area_id: {date_str: util}} where util is a float OR,
+    for Leaside, a dict {"total": f, "indoor_padel": f, "outdoor_padel": f, "pickle": f}.
+
+    Definition of capacity: the sum of `court_count × slot_duration_hours` across every
+    session the PodPlay `/sessions` API returned for that pod on that day. The API
+    only returns bookable slots within each pod's operating hours, so this is the
+    exact set of court-hours that could have been booked — no fixed-hour assumption
+    needed. Utilization = booked court-hours / bookable court-hours.
+    """
     pod_to_area = info["pod_to_area"]
     pod_capacity = info["pod_capacity"]
     pod_category = info["pod_category"]
@@ -263,6 +330,7 @@ def compute_utilization(sessions: list, info: dict) -> dict:
     area_name = info["area_name"]
 
     pod_day_booked: dict[tuple[str, str], float] = {}
+    pod_day_capacity: dict[tuple[str, str], float] = {}
 
     for s in sessions:
         pod_obj = s.get("pod") or {}
@@ -274,8 +342,8 @@ def compute_utilization(sessions: list, info: dict) -> dict:
         if not start:
             continue
         end = parse_iso(s.get("endTime")) or (start + timedelta(minutes=30))
-        duration_hh = max(0.0, (end - start).total_seconds() / 1800.0)
-        if duration_hh <= 0:
+        duration_h = max(0.0, (end - start).total_seconds() / 3600.0)
+        if duration_h <= 0:
             continue
 
         tz = ZoneInfo(pod_timezone[pod])
@@ -284,12 +352,12 @@ def compute_utilization(sessions: list, info: dict) -> dict:
         cap = pod_capacity[pod]
         tables_left = s.get("tablesLeft")
         if tables_left is None:
-            # Assume fully open if not provided
             tables_left = cap
         courts_booked = max(0, cap - int(tables_left))
-        booked_court_hh = courts_booked * duration_hh
+
         key = (pod, day_str)
-        pod_day_booked[key] = pod_day_booked.get(key, 0.0) + booked_court_hh
+        pod_day_booked[key] = pod_day_booked.get(key, 0.0) + courts_booked * duration_h
+        pod_day_capacity[key] = pod_day_capacity.get(key, 0.0) + cap * duration_h
 
     # Group pods by area
     area_pods: dict[str, list[str]] = {}
@@ -299,7 +367,7 @@ def compute_utilization(sessions: list, info: dict) -> dict:
     util: dict[str, dict[str, float | dict]] = {}
     for area_id, pods in area_pods.items():
         is_leaside = "leaside" in area_name.get(area_id, "")
-        days_seen = {d for (p, d) in pod_day_booked if p in pods}
+        days_seen = {d for (p, d) in pod_day_capacity if p in pods}
         util[area_id] = {}
         for d in sorted(days_seen):
             if is_leaside:
@@ -307,7 +375,7 @@ def compute_utilization(sessions: list, info: dict) -> dict:
                 total_b, total_c = 0.0, 0.0
                 for pod in pods:
                     b = pod_day_booked.get((pod, d), 0.0)
-                    c = float(pod_capacity[pod] * CAPACITY_HALFHOURS_PER_DAY)
+                    c = pod_day_capacity.get((pod, d), 0.0)
                     cat = pod_category[pod]
                     bb, cc = by_cat.get(cat, (0.0, 0.0))
                     by_cat[cat] = (bb + b, cc + c)
@@ -326,7 +394,7 @@ def compute_utilization(sessions: list, info: dict) -> dict:
                 b, c = 0.0, 0.0
                 for pod in pods:
                     b += pod_day_booked.get((pod, d), 0.0)
-                    c += pod_capacity[pod] * CAPACITY_HALFHOURS_PER_DAY
+                    c += pod_day_capacity.get((pod, d), 0.0)
                 util[area_id][d] = clamp01(b / c) if c > 0 else None
 
     return util
