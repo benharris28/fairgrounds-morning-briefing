@@ -298,11 +298,14 @@ def fetch_areas() -> dict:
 
 # ----------------------------- Sessions + events -----------------------------
 
-MAX_SESSION_WINDOW_DAYS = 7  # PodPlay returns 500/503 for wider ranges
+# PodPlay /sessions has a ~5,000-item response cap (500s above it), not a date
+# limit. A "session" is one 30-min slot per pod, so volume scales with pod
+# count (~920/day across 33 pods). 3-day chunks peak ~2,800 items, well under.
+MAX_SESSION_WINDOW_DAYS = 3
 
 
 def fetch_sessions(start: date, end: date) -> list:
-    """Fetch /sessions; auto-chunks windows larger than 7 days (PodPlay limit)."""
+    """Fetch /sessions; auto-chunks windows larger than 3 days (PodPlay limit)."""
     total_days = (end - start).days
     if total_days <= MAX_SESSION_WINDOW_DAYS:
         path = f"/sessions?startTime={start.isoformat()}T04:00:00Z&endTime={end.isoformat()}T07:00:00Z"
