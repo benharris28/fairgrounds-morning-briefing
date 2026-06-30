@@ -24,6 +24,7 @@ from __future__ import annotations
 import base64
 import csv
 import glob
+import gzip
 import http.client
 import io
 import json
@@ -104,6 +105,7 @@ def podplay_get(path: str, timeout: int = 90, max_retries: int = 5) -> dict:
     headers = {
         "x-api-key": key,
         "accept": "application/json",
+        "accept-encoding": "gzip",
         "user-agent": USER_AGENT,
     }
     last_exc: Exception | None = None
@@ -111,7 +113,10 @@ def podplay_get(path: str, timeout: int = 90, max_retries: int = 5) -> dict:
         try:
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                return json.loads(r.read())
+                raw = r.read()
+                if r.headers.get("content-encoding") == "gzip":
+                    raw = gzip.decompress(raw)
+                return json.loads(raw)
         except urllib.error.HTTPError as e:
             # Retry only 5xx + 429; re-raise 4xx immediately (auth/bad request)
             if e.code < 500 and e.code != 429:
