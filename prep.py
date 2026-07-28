@@ -57,7 +57,8 @@ CHANNEL_MAP_TEST = {
 
 CHANNEL_MAP_PROD = {
     "barton":         {"channel_id": "C0A6TM6S9PS", "channel_name": "fg-hamilton",       "label": "Hamilton"},
-    "base31":         {"channel_id": "C0A884F40MU", "channel_name": "fg-base31",         "label": "Base31"},
+    "base 31":        {"channel_id": "C0A884F40MU", "channel_name": "fg-base31",         "label": "Base31"},
+    "bells corners":  {"channel_id": "C0B71LTT2CQ", "channel_name": "fg-ottawa",         "label": "Bells Corners"},
     "capilano":       {"channel_id": "C09SYG49DCM", "channel_name": "fg-capilano",       "label": "Capilano"},
     "cataraqui":      {"channel_id": "C0A1CAWUVBM", "channel_name": "fg-kingston",       "label": "Kingston"},
     "cloverdale":     {"channel_id": "C0AR9CFL5EH", "channel_name": "fg-cloverdale",     "label": "Cloverdale"},
@@ -82,9 +83,10 @@ HEATMAP_ROWS = [
     ("Whitby",                  ("whitby", "main")),
     ("Hamilton",                ("barton", "main")),
     ("Red Deer",                ("red deer", "main")),
-    ("Base31",                  ("base31", "main")),
+    ("Base31",                  ("base 31", "main")),
     ("Stackt",                  ("stackt", "main")),
     ("Assembly Park",           ("assembly park", "main")),
+    ("Bells Corners",           ("bells corners", "main")),
 ]
 
 HANGUL_FILLER = "\u3164"  # invisible line for Slack vertical spacing

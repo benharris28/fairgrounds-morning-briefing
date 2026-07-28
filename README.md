@@ -91,7 +91,7 @@ Optional env vars:
 
 **Test mode (B28 workspace):** fg-kingston, fg-cloverdale, fg-leaside, fg-whitby.
 
-**Prod mode (Fairgrounds workspace):** all 11 active sites. Both maps live in `prep.py` under `CHANNEL_MAP_TEST` / `CHANNEL_MAP_PROD`.
+**Prod mode (Fairgrounds workspace):** all 12 active sites. Both maps live in `prep.py` under `CHANNEL_MAP_TEST` / `CHANNEL_MAP_PROD`.
 
 ## Output files (written to `/tmp/`)
 
