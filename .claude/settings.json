@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 prep.py prod)",
+      "Bash(python3 prep.py test)",
+      "Bash(python3 prep.py finalize:*)",
+      "mcp__Google-Drive__create_file",
+      "mcp__Slack__slack_send_message"
+    ]
+  }
+}

@@ -3,27 +3,31 @@
 Morning briefing prep for Fairgrounds.
 
 Deterministic pipeline: fetch PodPlay data, compute utilization, build 14-day
-heatmap CSV, upload to Google Drive, render Slack messages, write results to
-/tmp/ for an LLM agent to post.
+heatmap CSV, render Slack messages, write results to /tmp/. The routine agent
+then uploads the sheet and posts the messages through its own Google Drive and
+Slack connectors. This script never talks to MCP servers or reads session
+credentials.
 
 Runs inside the scheduled trigger environment. Dependencies: stdlib only.
 
+Usage:
+  python3 prep.py prod|test            # fetch + render; messages hold HEATMAP_URL_PLACEHOLDER
+  python3 prep.py finalize <sheet_url> # swap the uploaded sheet's URL into messages.json
+                                       # (pass "" to fall back to the Heatmaps folder URL)
+
 Env vars read:
   API_KEY          — PodPlay JWT (required)
-  MODE             — 'test' (only post to B28 test channels) or 'prod' (all channels).
-                     Defaults to 'test'.
-  DRY_RUN          — if set, skip the Drive upload and use a placeholder URL.
+  MODE             — fallback for the mode argument. Defaults to 'test'.
 
 Output files:
   /tmp/briefing_output.json — full structured output (diagnostics + per-area data)
-  /tmp/messages.json        — {channel_id: {"name": str, "body": str}} for posting
+  /tmp/messages.json        — {channel_id: {"name": str, "label": str, "body": str}} for posting
+  /tmp/heatmap_upload.json  — exact arguments for the Drive connector's create_file tool
   /tmp/briefing_status.json — {"ok": bool, "errors": [...], "sheet_url": str|null}
 """
 from __future__ import annotations
 
-import base64
 import csv
-import glob
 import gzip
 import http.client
 import io
@@ -45,6 +49,7 @@ from zoneinfo import ZoneInfo
 PODPLAY_BASE = "https://fairgrounds.podplay.app/apis/v2"
 HEATMAP_FOLDER_ID = "1S_Cn6mgoKnMh00lBc78YsX-9wDfxYmTP"
 HEATMAP_FOLDER_URL = f"https://drive.google.com/drive/folders/{HEATMAP_FOLDER_ID}"
+HEATMAP_URL_PLACEHOLDER = "__HEATMAP_URL__"
 
 
 # Channel mappings (test vs prod). Match by substring (case-insensitive) against displayName.
@@ -137,81 +142,6 @@ def podplay_get(path: str, timeout: int = 90, max_retries: int = 5) -> dict:
         time.sleep(backoff)
     assert last_exc is not None
     raise last_exc
-
-
-def mcp_discover() -> tuple[str, str, str]:
-    """Return (slack_url, drive_url, bearer_token)."""
-    cfg_paths = glob.glob("/tmp/mcp-config-*.json")
-    if not cfg_paths:
-        raise RuntimeError("No /tmp/mcp-config-*.json found")
-    with open(cfg_paths[0]) as f:
-        cfg = json.load(f)
-    servers = cfg.get("mcpServers", {})
-    slack_url = servers.get("Slack", {}).get("url", "")
-    drive_url = servers.get("Google-Drive", {}).get("url", "")
-
-    token_path = "/home/claude/.claude/remote/.session_ingress_token"
-    token = ""
-    if os.path.exists(token_path):
-        token = open(token_path).read().strip()
-    else:
-        try:
-            token = os.read(4, 4096).decode().strip()
-        except Exception:
-            pass
-    if not token:
-        raise RuntimeError("Could not read ingress token")
-    return slack_url, drive_url, token
-
-
-MCP_HEADERS_BASE = {
-    "Content-Type": "application/json",
-    # Streamable HTTP transport requires both; server picks one in Content-Type.
-    "Accept": "application/json, text/event-stream",
-}
-
-
-def _mcp_parse_response(raw: bytes, content_type: str) -> dict:
-    """MCP Streamable HTTP can reply with application/json OR text/event-stream.
-    In SSE the body is a sequence of `data: <json>\\n\\n` frames; we want the
-    last `data:` line (the final JSON-RPC response)."""
-    ct = (content_type or "").lower()
-    text = raw.decode("utf-8", errors="replace")
-    if "text/event-stream" in ct or text.lstrip().startswith("event:") or text.lstrip().startswith("data:"):
-        last_data = None
-        for line in text.splitlines():
-            if line.startswith("data:"):
-                last_data = line[5:].strip()
-        if last_data is None:
-            raise ValueError(f"SSE response had no data frames: {text[:200]!r}")
-        return json.loads(last_data)
-    return json.loads(text)
-
-
-def mcp_list_tools(url: str, token: str, timeout: int = 30) -> list[str]:
-    """Return the tool names exposed by an MCP server at URL."""
-    body = json.dumps({"jsonrpc": "2.0", "method": "tools/list", "id": 1}).encode()
-    req = urllib.request.Request(url, data=body, headers={
-        **MCP_HEADERS_BASE,
-        "Authorization": f"Bearer {token}",
-    })
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        resp = _mcp_parse_response(r.read(), r.headers.get("Content-Type", ""))
-    tools = (resp.get("result") or {}).get("tools", []) or []
-    return [t.get("name") for t in tools if t.get("name")]
-
-
-def mcp_call(url: str, token: str, tool_name: str, args: dict, timeout: int = 60) -> dict:
-    body = json.dumps({
-        "jsonrpc": "2.0", "method": "tools/call", "id": 1,
-        "params": {"name": tool_name, "arguments": args},
-    }).encode()
-    req = urllib.request.Request(url, data=body, headers={
-        **MCP_HEADERS_BASE,
-        "Authorization": f"Bearer {token}",
-    })
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return _mcp_parse_response(r.read(), r.headers.get("Content-Type", ""))
 
 
 # ----------------------------- Areas + pods -----------------------------
@@ -674,122 +604,6 @@ def build_csv(util: dict, info: dict, today: date) -> str:
     return buf.getvalue()
 
 
-# Candidate tool names to try when creating a file on the Drive MCP.
-# claude.ai's Drive connector uses `create_file`; Google's drivemcp.googleapis.com
-# may use different naming. We try each in order and use the first that works.
-DRIVE_CREATE_CANDIDATES = [
-    "create_file",
-    "createFile",
-    "drive_create_file",
-    "files_create",
-    "upload_file",
-    "uploadFile",
-]
-
-
-def _url_from_meta(meta: dict) -> str | None:
-    if not isinstance(meta, dict):
-        return None
-    url = meta.get("viewUrl") or meta.get("webViewLink") or meta.get("url")
-    if url:
-        return url
-    fid = meta.get("id")
-    if fid:
-        return f"https://docs.google.com/spreadsheets/d/{fid}"
-    return None
-
-
-def _extract_file_url(resp: dict) -> str | None:
-    """Try multiple response shapes to extract a Drive file URL or ID."""
-    try:
-        result = resp.get("result") or {}
-        # Shape 1 (MCP 2025 spec): structuredContent holds the tool's return object
-        sc = result.get("structuredContent")
-        if isinstance(sc, dict):
-            url = _url_from_meta(sc)
-            if url:
-                return url
-        # Shape 2: result.content[].text contains JSON
-        for c in (result.get("content") or []):
-            text = c.get("text")
-            if not text:
-                continue
-            try:
-                meta = json.loads(text)
-            except Exception:
-                continue
-            url = _url_from_meta(meta)
-            if url:
-                return url
-        # Shape 3: direct metadata on result
-        url = _url_from_meta(result)
-        if url:
-            return url
-    except Exception:
-        pass
-    return None
-
-
-def upload_sheet(
-    csv_content: str,
-    drive_url: str,
-    token: str,
-    today: date,
-    errors: list[str],
-    drive_tools: list[str] | None = None,
-) -> str | None:
-    """Upload CSV to Drive as a Google Sheet; return viewUrl or None on failure.
-    Appends detailed diagnostics to `errors` so they show up in briefing_status.json."""
-    b64 = base64.b64encode(csv_content.encode("utf-8")).decode("ascii")
-    args = {
-        "title": f"Fairgrounds Utilization {today.isoformat()}",
-        "mimeType": "text/csv",
-        "parentId": HEATMAP_FOLDER_ID,
-        "content": b64,
-    }
-
-    # Prefer tools we know exist on this MCP; fall back to the full candidate list.
-    if drive_tools:
-        try_tools = [t for t in DRIVE_CREATE_CANDIDATES if t in drive_tools] or drive_tools
-    else:
-        try_tools = DRIVE_CREATE_CANDIDATES
-
-    for tool in try_tools:
-        try:
-            resp = mcp_call(drive_url, token, tool, args)
-        except urllib.error.HTTPError as he:
-            body = ""
-            try:
-                body = he.read().decode()[:500]
-            except Exception:
-                pass
-            errors.append(f"drive {tool}: HTTP {he.code} {body}")
-            print(f"[upload_sheet] {tool} HTTP {he.code}: {body}", file=sys.stderr)
-            continue
-        except Exception as e:
-            errors.append(f"drive {tool}: {type(e).__name__}: {e}")
-            print(f"[upload_sheet] {tool} raised: {e}", file=sys.stderr)
-            continue
-
-        # Check for MCP-level error in response
-        if isinstance(resp, dict) and "error" in resp:
-            errors.append(f"drive {tool}: MCP error {resp['error']}")
-            print(f"[upload_sheet] {tool} returned MCP error: {resp.get('error')}", file=sys.stderr)
-            continue
-
-        url = _extract_file_url(resp)
-        if url:
-            print(f"[upload_sheet] success via {tool}: {url}", file=sys.stderr)
-            return url
-
-        # Response looked ok but we couldn't extract a URL — log raw for debugging
-        snippet = json.dumps(resp)[:500]
-        errors.append(f"drive {tool}: could not parse response — {snippet}")
-        print(f"[upload_sheet] {tool} response had no URL: {snippet}", file=sys.stderr)
-
-    return None
-
-
 # ----------------------------- Slack message rendering -----------------------------
 
 def fmt_time_range(start: datetime | None, end: datetime | None, tz: ZoneInfo) -> str:
@@ -879,21 +693,19 @@ def render_message(
 
 # ----------------------------- Orchestrator -----------------------------
 
-def main() -> int:
+def main(mode: str) -> int:
     errors: list[str] = []
     status: dict = {"ok": False, "errors": errors, "sheet_url": None}
 
     try:
-        mode = os.environ.get("MODE", "test").lower()
         channel_map = CHANNEL_MAP_TEST if mode == "test" else CHANNEL_MAP_PROD
-        dry_run = bool(os.environ.get("DRY_RUN"))
 
         # Today in UTC (the briefing uses local day boundaries per pod tz, but API window starts today UTC)
         today = datetime.now(timezone.utc).date()
         tomorrow = today + timedelta(days=1)
         heatmap_end = today + timedelta(days=14)
 
-        print(f"[prep] mode={mode} today={today} dry_run={dry_run}", file=sys.stderr)
+        print(f"[prep] mode={mode} today={today}", file=sys.stderr)
 
         # --- Fetch areas ---
         info = fetch_areas()
@@ -925,34 +737,21 @@ def main() -> int:
         today_util = compute_utilization(today_sessions, info)
         forward_util = compute_utilization(forward_sessions, info)
 
-        # --- Build heatmap CSV + upload ---
+        # --- Build heatmap CSV + upload args for the agent's Drive connector ---
         csv_content = build_csv(forward_util, info, today)
         # Write a local copy for debugging
         with open("/tmp/heatmap.csv", "w", encoding="utf-8") as f:
             f.write(csv_content)
+        with open("/tmp/heatmap_upload.json", "w", encoding="utf-8") as f:
+            json.dump({
+                "title": f"Fairgrounds Utilization {today.isoformat()}",
+                "parentId": HEATMAP_FOLDER_ID,
+                "contentMimeType": "text/csv",
+                "textContent": csv_content,
+            }, f, ensure_ascii=False, indent=2)
 
-        heatmap_url = None
-        if not dry_run:
-            slack_url, drive_url, token = mcp_discover()
-            # Probe the Drive MCP's actual tool surface — helps when the trigger's
-            # Drive MCP (e.g. drivemcp.googleapis.com) doesn't match claude.ai's schema.
-            drive_tools: list[str] = []
-            try:
-                drive_tools = mcp_list_tools(drive_url, token)
-                print(f"[prep] drive_tools={drive_tools}", file=sys.stderr)
-                status["drive_tools"] = drive_tools
-            except Exception as e:
-                errors.append(f"drive tools/list failed: {type(e).__name__}: {e}")
-                print(f"[prep] drive tools/list failed: {e}", file=sys.stderr)
-            heatmap_url = upload_sheet(csv_content, drive_url, token, today, errors, drive_tools)
-            if not heatmap_url:
-                errors.append("Drive upload failed; using folder URL as fallback")
-                heatmap_url = HEATMAP_FOLDER_URL
-        else:
-            heatmap_url = HEATMAP_FOLDER_URL + "  (dry run, not uploaded)"
-
-        status["sheet_url"] = heatmap_url
-        print(f"[prep] heatmap_url={heatmap_url}", file=sys.stderr)
+        # Real URL is swapped in by `prep.py finalize` after the agent uploads the sheet.
+        heatmap_url = HEATMAP_URL_PLACEHOLDER
 
         # --- Build Slack messages per target channel ---
         messages: dict[str, dict] = {}
@@ -1032,5 +831,40 @@ def main() -> int:
     return 0 if status["ok"] else 1
 
 
+def finalize(sheet_url: str) -> int:
+    """Replace the heatmap placeholder in /tmp/messages.json with the uploaded
+    sheet's URL (or the Heatmaps folder URL if the upload failed)."""
+    with open("/tmp/briefing_status.json", encoding="utf-8") as f:
+        status = json.load(f)
+    if not status.get("ok"):
+        print("prep did not succeed; refusing to finalize", file=sys.stderr)
+        return 1
+
+    url = sheet_url.strip()
+    if not url:
+        status["errors"].append("Drive upload failed; using folder URL as fallback")
+        url = HEATMAP_FOLDER_URL
+
+    with open("/tmp/messages.json", encoding="utf-8") as f:
+        messages = json.load(f)
+    for m in messages.values():
+        m["body"] = m["body"].replace(HEATMAP_URL_PLACEHOLDER, url)
+    with open("/tmp/messages.json", "w", encoding="utf-8") as f:
+        json.dump(messages, f, ensure_ascii=False, indent=2)
+
+    status["sheet_url"] = url
+    with open("/tmp/briefing_status.json", "w", encoding="utf-8") as f:
+        json.dump(status, f, ensure_ascii=False, indent=2, default=str)
+    print(json.dumps({"ok": True, "sheet_url": url, "message_count": len(messages)}))
+    return 0
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    args = sys.argv[1:]
+    if args and args[0] == "finalize":
+        sys.exit(finalize(args[1] if len(args) > 1 else ""))
+    mode = (args[0] if args else os.environ.get("MODE", "test")).lower()
+    if mode not in ("test", "prod"):
+        print("usage: prep.py prod|test  |  prep.py finalize <sheet_url>", file=sys.stderr)
+        sys.exit(2)
+    sys.exit(main(mode))

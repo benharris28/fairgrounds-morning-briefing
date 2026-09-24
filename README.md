@@ -19,9 +19,8 @@ The design splits into a deterministic Python pipeline + a tiny LLM agent.
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │ Claude Code scheduled trigger (env_01QtXL9hzpTgWzS3sunQz1KY) │
-│  7:30 AM ET cron                                              │
-│  ├─ curl raw.githubusercontent.com/…/prep.py                  │
-│  ├─ python3 /tmp/prep.py                                      │
+│  cron · this repo attached as the routine's source            │
+│  ├─ python3 prep.py prod           (from the checkout)        │
 │  │    ├─ GET /areas                                           │
 │  │    ├─ GET /sessions (today)    ─┐                          │
 │  │    ├─ GET /events (today)       ├─ parallel                │
@@ -29,9 +28,11 @@ The design splits into a deterministic Python pipeline + a tiny LLM agent.
 │  │    ├─ GET /events/{id}/signups  (top-10 by signups)        │
 │  │    ├─ compute utilization                                  │
 │  │    ├─ build CSV                                            │
-│  │    ├─ upload to Google Drive via Google-Drive MCP          │
+│  │    ├─ write /tmp/heatmap_upload.json                       │
 │  │    └─ render Slack messages → /tmp/messages.json           │
-│  └─ agent loops messages.json, posts each via Slack MCP       │
+│  ├─ agent: Google-Drive create_file (heatmap_upload.json)     │
+│  ├─ python3 prep.py finalize <sheet_url>                      │
+│  └─ agent: Slack slack_send_message per messages.json entry   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -39,8 +40,18 @@ The design splits into a deterministic Python pipeline + a tiny LLM agent.
 
 ### Files
 
-- `prep.py` — the whole pipeline. Stdlib-only Python (no pip install needed in the trigger sandbox). Fetches data, computes utilization, uploads the heatmap sheet, renders Slack message bodies.
-- The trigger prompt (in Claude Code's RemoteTrigger config, not in this repo) is ~60 lines: `curl prep.py → python3 prep.py → loop messages.json → post`.
+- `prep.py` — the whole pipeline. Stdlib-only Python (no pip install needed in the trigger sandbox). Fetches data, computes utilization, builds the heatmap CSV, renders Slack message bodies. It never calls MCP servers or reads session credentials — the agent does all Drive and Slack writes through its own connectors.
+- `routine-prompt.md` — the exact prompt the routine runs. Keep it in sync with the RemoteTrigger config.
+- `.claude/settings.json` — pre-approves the pipeline's commands and the two connector tools it uses, so the unattended run isn't waiting on a permission decision.
+
+### Why it's built this way (auto mode)
+
+Routines run in auto mode, where a safety classifier reviews each action and a saved prompt doesn't count as live user approval. Two things in the original design were blocked every morning from at least early September 2026:
+
+1. **`curl … prep.py && python3 prep.py`** — downloading code and running it straight away is blocked as "Code from External". The repo is now attached as the routine's source, so the code is already checked out.
+2. **Reading `.session_ingress_token` and calling the Slack/Drive MCP URLs by hand.** That's credential use behind the harness's back. The agent now calls `create_file` and `slack_send_message` as normal connector tools.
+
+Don't reintroduce either pattern.
 
 ## Utilization math
 
@@ -77,15 +88,11 @@ Color thresholds for the heatmap CSV:
 
 The script expects to run inside a Claude Code scheduled trigger sandbox with:
 
-- `$API_KEY` — PodPlay JWT
-- `/tmp/mcp-config-*.json` — MCP server URLs for `Slack` and `Google-Drive`
-- `/home/claude/.claude/remote/.session_ingress_token` — MCP bearer token
+- `$API_KEY` — PodPlay JWT (set on the routine's environment)
+- Slack + Google-Drive connectors attached to the routine
 - Python 3.11+ (stdlib only)
 
-Optional env vars:
-
-- `MODE` — `test` (default) posts to the B28 test channels only. `prod` posts to all Fairgrounds site channels.
-- `DRY_RUN` — any truthy value skips the Drive upload and uses a placeholder URL. Useful for local testing.
+Mode is the first argument: `python3 prep.py test` (B28 test channels) or `python3 prep.py prod` (all Fairgrounds site channels). `$MODE` is used if no argument is given.
 
 ## Channel mappings
 
@@ -98,13 +105,14 @@ Optional env vars:
 - `briefing_output.json` — full diagnostic dump (per-channel data, utilization, counts)
 - `messages.json` — `{channel_id: {"name", "label", "body"}}` — exactly what gets posted
 - `briefing_status.json` — `{"ok": bool, "errors": [...], "sheet_url": str|null}`
+- `heatmap_upload.json` — `{title, parentId, contentMimeType, textContent}`, passed as-is to Drive `create_file`
 - `heatmap.csv` — local copy of the uploaded CSV for debugging
 
 ## Operations
 
 ### Updating the logic
 
-Push to `main`. The scheduled trigger fetches `prep.py` fresh on every run, so changes go live at the next cron firing (or next manual `RemoteTrigger run`). Note: `raw.githubusercontent.com` caches for 5 minutes — updates may take that long to propagate.
+Push to `main`. The routine checks out the repo fresh on every run, so changes go live at the next cron firing (or next manual `RemoteTrigger run`).
 
 ### Running manually
 
@@ -113,11 +121,11 @@ From your local machine (needs `$API_KEY` from the Fairgrounds `.env`):
 ```bash
 cd Projects/Fairgrounds
 set -a && source .env && set +a
-DRY_RUN=1 MODE=test python3 ../fairgrounds-morning-briefing/prep.py
+python3 ../fairgrounds-morning-briefing/prep.py test
 cat /tmp/briefing_status.json
 ```
 
-Without the MCP config (which only exists inside the trigger sandbox), the upload + post steps can't run from a laptop. For end-to-end testing outside the trigger, upload `/tmp/heatmap.csv` manually to the Drive folder and use a Slack client to post each message from `/tmp/messages.json`.
+This only fetches and renders — nothing is uploaded or posted. Message bodies contain `__HEATMAP_URL__` until you run `prep.py finalize <url>`.
 
 ### Triggering a real run
 
@@ -129,7 +137,7 @@ Or let the 7:30 AM ET cron fire.
 
 ### Debugging a failed run
 
-1. Inspect the trigger's session output in claude.ai (look for `/tmp/briefing_status.json` echo at the end of the transcript).
+1. `RemoteTrigger action=list_runs` then `get_run_log` on the run. Look for `permission_denied` lines first — a classifier block looks like a success in the run list.
 2. If the script errored during fetch: re-run manually from your laptop against live PodPlay data to reproduce.
 3. If the agent errored after `prep.py` succeeded: the `messages.json` + `briefing_output.json` in the sandbox are probably fine; the issue is in the posting loop (check Slack MCP response).
 
@@ -137,11 +145,13 @@ Or let the 7:30 AM ET cron fire.
 
 - **Trigger ID:** `trig_018iWCX8x1GDCLhYPJv8Yot8`
 - **Name:** Morning Briefing Bot
-- **Cron:** `30 11 * * *` (7:30 AM ET)
+- **Cron:** `30 9 * * *` (UTC)
 - **Environment:** `env_01QtXL9hzpTgWzS3sunQz1KY`
-- **Model:** `claude-sonnet-4-6`
+- **Source repo:** `benharris28/fairgrounds-morning-briefing`
+- **Model:** `claude-opus-5-5`
 - **MCP connectors:** Slack + Google-Drive
-- **Allowed tools:** Bash, Read, Write, Edit, Glob, Grep, WebFetch, WebSearch, ToolSearch
+- **Allowed tools:** Bash, Read, Glob, Grep, ToolSearch
+- **Prompt:** `routine-prompt.md`
 
 ## Heatmap sheet archive
 
