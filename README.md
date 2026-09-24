@@ -46,10 +46,10 @@ The design splits into a deterministic Python pipeline + a tiny LLM agent.
 
 ### Why it's built this way (auto mode)
 
-Routines run in auto mode, where a safety classifier reviews each action and a saved prompt doesn't count as live user approval. Two things in the original design were blocked every morning from at least early September 2026:
+Routines run in auto mode, where a safety classifier reviews each action and a saved prompt doesn't count as live user approval. The original design ran fine through 2026-09-17. From 2026-09-18 every run was blocked at step 1, with no change to the routine or this repo:
 
 1. **`curl … prep.py && python3 prep.py`** — downloading code and running it straight away is blocked as "Code from External". The repo is now attached as the routine's source, so the code is already checked out.
-2. **Reading `.session_ingress_token` and calling the Slack/Drive MCP URLs by hand.** That's credential use behind the harness's back. The agent now calls `create_file` and `slack_send_message` as normal connector tools.
+2. **Reading `.session_ingress_token` and calling the Slack/Drive MCP URLs by hand.** This was never reached after 09-18, but it's credential use behind the harness's back and the same kind of pattern auto mode blocks. The agent now calls `create_file` and `slack_send_message` as normal connector tools. That also removes the hand-written posting loop, which needed an on-the-fly SSE-parsing fix on 09-16.
 
 Don't reintroduce either pattern.
 
